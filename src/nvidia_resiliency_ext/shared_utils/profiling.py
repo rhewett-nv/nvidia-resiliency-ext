@@ -197,6 +197,7 @@ class FaultToleranceProfiler:
                 pass
         self._otel_cycle_span = None
         self._otel_cycle_ctx = None
+        self._otel_cycle_start_ns = None  # cleared so a closed cycle can't leak its start timestamp
         self._otel_outcome = None
         self._otel_extra = {}
 
@@ -260,10 +261,15 @@ class FaultToleranceProfiler:
                             pass
                         self._otel_attr = None
                 elif action == 'await_open':
-                    # a standby node loops RENDEZVOUS_STARTED->health_check without RENDEZVOUS_COMPLETED,
-                    # so close any phase it left open before we start waiting -- otherwise the open
-                    # 'rendezvous' phase would span the whole standby wait and double-count await_round.
-                    self._otel_end_phase(ns)
+                    # A standby/looping node re-enters the Step-0 wait still holding the PRIOR round's
+                    # OPEN cycle + phase (it started that round's rendezvous but was not selected, so no
+                    # WORKER_TERMINATED closed it). Close the whole cycle -- not just the phase -- so the
+                    # next RENDEZVOUS_STARTED opens a FRESH cycle with the correct start timestamp/number.
+                    # Otherwise _otel_cycle_open's "already open" guard keeps the stale cycle and a later
+                    # promoted spare reuses the earlier round's span/cycle-start (wrong attribution).
+                    # No-op for a normal node: its cycle is already closed (worker_terminated) before it
+                    # loops, and await_open always precedes cycle_open within a round.
+                    self._otel_cycle_close(ns, 'standby')  # also ends the open phase (via _otel_end_phase)
                     self._otel_await = self._otel_span('nvrx.restart.await_round', ns, node_id_str,
                                                        parent=False)  # ROOT: precedes any cycle
                 elif action == 'await_close':
