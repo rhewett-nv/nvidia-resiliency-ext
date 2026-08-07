@@ -25,6 +25,12 @@ from typing import Any, Optional
 
 from ..shared_utils.log_manager import LogConfig
 
+try:  # torchelastic delivers the FT death signal as SignalException (an Exception subclass)
+    from torch.distributed.elastic.multiprocessing import SignalException as _SignalException
+except Exception:  # torchelastic absent -> sentinel that never matches a real signal
+    class _SignalException(Exception):
+        pass
+
 
 _NODE_DESC_SUFFIX = re.compile(r'_\d+_\d+$')  # node_desc appends _<pid>_<local_rank>
 
@@ -61,6 +67,9 @@ class FaultToleranceProfiler:
         # OTel per-cycle span TREE state (set by the ft_launcher agent via attach_otel, its process).
         self._otel_tracer = None
         self._otel_flush = None
+        # C1: guards recorder span-state — mutated by the launcher MAIN thread AND the
+        # attribution poller DAEMON thread (health_check _poll_loop -> ATTRIBUTION_GET_*).
+        self._otel_lock = threading.RLock()
         self._otel_cycle_span = None   # per-cycle PARENT span ('nvrx.restart.cycle')
         self._otel_cycle_ctx = None    # parent context, so phase spans nest as CHILDREN (one trace/cycle)
         self._otel_phase = None        # (name, span) of the single currently-open phase (sweep model)
@@ -120,15 +129,16 @@ class FaultToleranceProfiler:
     def otel_annotate_cycle(self, **attrs):
         """Agent enriches the currently-open cycle span with restart-budget/rendezvous metadata
         (the recorder opens the cycle at rendezvous; the agent is who knows the budget)."""
-        sp = self._otel_cycle_span
-        if sp is None:
-            return
-        try:
-            for k, v in attrs.items():
-                if v is not None:
-                    sp.set_attribute(k, v)
-        except Exception:
-            pass
+        with self._otel_lock:
+            sp = self._otel_cycle_span
+            if sp is None:
+                return
+            try:
+                for k, v in attrs.items():
+                    if v is not None:
+                        sp.set_attribute(k, v)
+            except Exception:
+                pass
 
     def otel_stage_outcome(self, outcome, **attrs):
         """Agent stages the cycle outcome (failed/peer_restart) BEFORE teardown; the recorder stamps
@@ -138,15 +148,16 @@ class FaultToleranceProfiler:
 
     def otel_finish_cycle(self, outcome='completed', **attrs):
         """Agent closes the cycle on a terminal state that has NO teardown event (success/terminated)."""
-        self._otel_outcome = outcome
-        if attrs:
-            self._otel_extra = attrs
-        self._otel_cycle_close(None, outcome)
-        if self._otel_flush is not None:
-            try:
-                self._otel_flush()
-            except Exception:
-                pass
+        with self._otel_lock:
+            self._otel_outcome = outcome
+            if attrs:
+                self._otel_extra = attrs
+            self._otel_cycle_close(None, outcome)
+            if self._otel_flush is not None:
+                try:
+                    self._otel_flush()
+                except Exception:
+                    pass
 
     def _otel_span(self, name, ns, node_id_str, rank=None, parent=True):
         """Start a span, parented to the current cycle span (child) when one is open. parent=False
@@ -246,6 +257,7 @@ class FaultToleranceProfiler:
             return
         node_id_str = _clean_node(node_id_str)
         ns = int(timestamp * 1e9)
+        self._otel_lock.acquire()
         try:
             # One-time "outside srun -> first nvrx" cold start: batch launch_script_start -> this
             # agent's FIRST recorded event. Backdated, closed immediately; per node, exactly once.
@@ -298,8 +310,12 @@ class FaultToleranceProfiler:
                         self._otel_await = None
             if self._otel_flush is not None:
                 self._otel_flush()
+        except (_SignalException, KeyboardInterrupt, SystemExit):
+            raise  # A1: never swallow the FT death signal (torchelastic raises it here)
         except Exception:
             pass  # telemetry must never break the launcher
+        finally:
+            self._otel_lock.release()
 
     def _timestamp_to_utc_datetime(self, timestamp: float) -> str:
         """Convert timestamp to UTC datetime string."""
