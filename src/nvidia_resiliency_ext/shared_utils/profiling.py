@@ -184,6 +184,23 @@ class FaultToleranceProfiler:
             self._otel_cycle_ctx = None
 
     def _otel_cycle_close(self, ns, outcome):
+        _ns = ns if ns is not None else int(time.time() * 1e9)
+        # Terminal/signal safety net: an unended span is an unexported span, so on a
+        # SIGTERM-driven close sweep up any still-open await (standby round-wait) or
+        # attribution span too -- otherwise a spare killed while waiting, or a node
+        # killed mid-attribution, leaks that span. No-op on a normal close (already None).
+        if self._otel_await is not None:
+            try:
+                self._otel_await.end(end_time=_ns)
+            except Exception:
+                pass
+            self._otel_await = None
+        if self._otel_attr is not None:
+            try:
+                self._otel_attr.end(end_time=_ns)
+            except Exception:
+                pass
+            self._otel_attr = None
         self._otel_end_phase(ns)
         sp = self._otel_cycle_span
         if sp is not None:
