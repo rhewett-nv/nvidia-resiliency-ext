@@ -45,7 +45,15 @@ except ImportError:
     HAS_NEMO_LENS = False
 
     class NemoLensConfig:  # noqa: D101
-        pass
+        enabled = False  # D2: worker setup reads .enabled -> returns early (no-op)
+
+        @classmethod
+        def from_env(cls, *args, **kwargs):
+            # D2: fallback (nemo-lens absent) must not AttributeError on NemoLensConfig.from_env(...).
+            return cls()
+
+        def __getattr__(self, name):  # any other attr the worker reads -> None (safe no-op)
+            return None
 
     def setup_telemetry(*args, **kwargs):
         """No-op -- returns a handle whose .tracer/.meter are no-ops and .shutdown() does nothing."""
