@@ -110,6 +110,10 @@ class FaultToleranceProfiler:
         'await_round_completed':     [('await_close', None)],
     }
 
+    # Events after which this node may be killed, so its spans must be force-flushed
+    # synchronously before the kill; routine events rely on BatchSpanProcessor's normal export.
+    _OTEL_FLUSH_EVENTS = frozenset({'failure_detected', 'worker_terminated', 'node_excluded'})
+
     def attach_otel(self, tracer, flush=None):
         """Register the ft_launcher agent's nemo-lens tracer so profiling events become a per-cycle
         span TREE with immediate flush. Called once, from the agent process, after setup_telemetry()."""
@@ -308,7 +312,7 @@ class FaultToleranceProfiler:
                         except Exception:
                             pass
                         self._otel_await = None
-            if self._otel_flush is not None:
+            if self._otel_flush is not None and event.value in self._OTEL_FLUSH_EVENTS:
                 self._otel_flush()
         except (_SignalException, KeyboardInterrupt, SystemExit):
             raise  # A1: never swallow the FT death signal (torchelastic raises it here)
