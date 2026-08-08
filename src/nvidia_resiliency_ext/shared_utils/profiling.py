@@ -280,6 +280,15 @@ class FaultToleranceProfiler:
                     self._otel_cycle_close(ns, arg)
                 elif action == 'phase':
                     self._otel_start_phase(arg, ns, node_id_str, rank)
+                    # F1: launching a worker means THIS node was selected active this
+                    # cycle -- stamp the cycle span at selection time so a node killed
+                    # after selection but before close still shows membership=active
+                    # (complements cycle_outcome: standby=not selected, excluded=evicted).
+                    if arg == 'worker_launch' and self._otel_cycle_span is not None:
+                        try:
+                            self._otel_cycle_span.set_attribute('nvrx.membership', 'active')
+                        except Exception:
+                            pass
                 elif action == 'end':
                     self._otel_end_phase(ns)
                 elif action == 'mark':
@@ -305,6 +314,13 @@ class FaultToleranceProfiler:
                     self._otel_cycle_close(ns, 'standby')  # also ends the open phase (via _otel_end_phase)
                     self._otel_await = self._otel_span('nvrx.restart.await_round', ns, node_id_str,
                                                        parent=False)  # ROOT: precedes any cycle
+                    # F2: the await span's whole lifetime IS the unselected/standby wait
+                    # (opens at Step-0 wait, closes when the round opens and the node
+                    # proceeds). Tag it so a spare is distinguishable by membership.
+                    try:
+                        self._otel_await.set_attribute('nvrx.membership', 'standby')
+                    except Exception:
+                        pass
                 elif action == 'await_close':
                     if self._otel_await is not None:
                         try:
