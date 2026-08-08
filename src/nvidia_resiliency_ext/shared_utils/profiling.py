@@ -224,7 +224,7 @@ class FaultToleranceProfiler:
                 for k, v in (self._otel_extra or {}).items():
                     if v is not None:
                         sp.set_attribute(k, v)
-                sp.end(end_time=ns if ns is not None else int(time.time() * 1e9))
+                sp.end(end_time=_ns)  # reuse the fallback computed at top (E4)
             except Exception:
                 pass
         self._otel_cycle_span = None
