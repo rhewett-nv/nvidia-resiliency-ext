@@ -45,11 +45,11 @@ except ImportError:
     HAS_NEMO_LENS = False
 
     class NemoLensConfig:  # noqa: D101
-        enabled = False  # D2: worker setup reads .enabled -> returns early (no-op)
+        enabled = False  # worker setup reads .enabled -> returns early (no-op)
 
         @classmethod
         def from_env(cls, *args, **kwargs):
-            # D2: fallback (nemo-lens absent) must not AttributeError on NemoLensConfig.from_env(...).
+            # fallback (nemo-lens absent) must not AttributeError on NemoLensConfig.from_env(...).
             return cls()
 
         def __getattr__(self, name):  # any other attr the worker reads -> None (safe no-op)

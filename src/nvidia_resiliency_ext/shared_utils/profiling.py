@@ -67,7 +67,7 @@ class FaultToleranceProfiler:
         # OTel per-cycle span TREE state (set by the ft_launcher agent via attach_otel, its process).
         self._otel_tracer = None
         self._otel_flush = None
-        # C1: guards recorder span-state — mutated by the launcher MAIN thread AND the
+        # guards recorder span-state — mutated by the launcher MAIN thread AND the
         # attribution poller DAEMON thread (health_check _poll_loop -> ATTRIBUTION_GET_*).
         self._otel_lock = threading.RLock()
         self._otel_cycle_span = None   # per-cycle PARENT span ('nvrx.restart.cycle')
@@ -224,7 +224,7 @@ class FaultToleranceProfiler:
                 for k, v in (self._otel_extra or {}).items():
                     if v is not None:
                         sp.set_attribute(k, v)
-                sp.end(end_time=_ns)  # reuse the fallback computed at top (E4)
+                sp.end(end_time=_ns)  # reuse the fallback computed at top
             except Exception:
                 pass
         self._otel_cycle_span = None
@@ -280,7 +280,7 @@ class FaultToleranceProfiler:
                     self._otel_cycle_close(ns, arg)
                 elif action == 'phase':
                     self._otel_start_phase(arg, ns, node_id_str, rank)
-                    # F1: launching a worker means THIS node was selected active this
+                    # launching a worker means THIS node was selected active this
                     # cycle -- stamp the cycle span at selection time so a node killed
                     # after selection but before close still shows membership=active
                     # (complements cycle_outcome: standby=not selected, excluded=evicted).
@@ -314,7 +314,7 @@ class FaultToleranceProfiler:
                     self._otel_cycle_close(ns, 'standby')  # also ends the open phase (via _otel_end_phase)
                     self._otel_await = self._otel_span('nvrx.restart.await_round', ns, node_id_str,
                                                        parent=False)  # ROOT: precedes any cycle
-                    # F2: the await span's whole lifetime IS the unselected/standby wait
+                    # the await span's whole lifetime IS the unselected/standby wait
                     # (opens at Step-0 wait, closes when the round opens and the node
                     # proceeds). Tag it so a spare is distinguishable by membership.
                     try:
@@ -331,7 +331,7 @@ class FaultToleranceProfiler:
             if self._otel_flush is not None and event.value in self._OTEL_FLUSH_EVENTS:
                 self._otel_flush()
         except (_SignalException, KeyboardInterrupt, SystemExit):
-            raise  # A1: never swallow the FT death signal (torchelastic raises it here)
+            raise  # never swallow the FT death signal (torchelastic raises it here)
         except Exception:
             pass  # telemetry must never break the launcher
         finally:
