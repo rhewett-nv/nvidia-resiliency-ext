@@ -512,10 +512,17 @@ class PersistentAsyncCaller(AsyncCaller):
             daemon=self.background_worker_is_daemon,
         )
 
-        # Propagate resource attributes for the background worker process
-        # through the environment.
+        # Megatron publishes final trainer identity after NVRx may have been
+        # imported, so extend the live carrier at the process-start boundary.
+        # Rank is only a compatibility fallback; role and instance identify this
+        # child and therefore intentionally replace their trainer values.
         with telemetry.publish_resource_attributes(
-            {"nv.dl.rank": rank, "service.instance.id": f"nvrx-ckpt{rank}"}
+            {
+                "nv.dl.role": "ckpt_worker",
+                "service.instance.id": f"nvrx-ckpt{rank}",
+            },
+            use_current=True,
+            fill_missing={"nv.dl.rank": rank},
         ):
             self.process.start()
         logger.debug(f"PersistentAsyncCaller: {rank}, Started Async Caller {self.process}")

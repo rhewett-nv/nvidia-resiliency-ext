@@ -68,6 +68,9 @@ try:
     from nemo.lens import trace_fn as trace_fn
     from nemo.lens.resources import extend_otel_resource_attributes as _extend_resource_attributes
     from nemo.lens.resources import publish_otel_resource_attributes as _publish_resource_attributes
+    from nemo.lens.resources.attributes import (
+        parse_otel_resource_attributes as _parse_resource_attributes,
+    )
     from nemo.lens.span_utilities import emit_span as _emit_span
     from nemo.lens.span_utilities import linux_process_create_time as _process_create_time
     from opentelemetry import context as _otel_context
@@ -272,23 +275,42 @@ def set_span_attributes(attributes: dict) -> None:
     _safe_set_span_attributes(_otel_trace.get_current_span(), attributes)
 
 
-def extended_resource_attributes(attributes: dict) -> str:
-    """Extend the inherited ``OTEL_RESOURCE_ATTRIBUTES`` with more pairs.
+def extended_resource_attributes(
+    attributes: dict, *, use_current: bool = False, fill_missing: Optional[dict] = None
+) -> str:
+    """Extend an ``OTEL_RESOURCE_ATTRIBUTES`` carrier with more pairs.
 
     NVRx never parses the variable -- it is an opaque string to extend. Extending is
-    always from the value inherited at start, never from the last extension, or a
-    relaunched cohort accumulates a key per cycle. ``overwrite`` because an NVRx key
-    already in the inherited value is stale: this process is the authority on it.
-    Returns the inherited value unchanged when nemo-lens is absent: NVRx emits no
-    telemetry then, so it has nothing to say about this process.
+    from the value inherited at import by default, never from the last extension, or
+    a relaunched cohort accumulates a key per cycle. ``use_current`` is reserved for
+    a child-process boundary that must inherit Resource identity published after this
+    module was imported. ``fill_missing`` supplies compatibility defaults without
+    replacing identity already present in the selected base. ``attributes`` always
+    overwrite because the publishing process is authoritative for them. Without
+    Lens, return the selected base unchanged; publication is inert.
     """
+    key = "OTEL_RESOURCE_ATTRIBUTES"
+    base = os.environ.get(key, "") if use_current else _INHERITED_RESOURCE_ATTRIBUTES
     if not _AVAILABLE:
-        return _INHERITED_RESOURCE_ATTRIBUTES
-    return _extend_resource_attributes(_INHERITED_RESOURCE_ATTRIBUTES, attributes, overwrite=True)
+        return base
+    if fill_missing:
+        # An explicitly empty value has no identity to preserve. Nonempty values,
+        # even malformed ones, remain authoritative over compatibility defaults.
+        empty_defaults = {
+            name
+            for name, value in _parse_resource_attributes(base).items()
+            if name in fill_missing and value == ""
+        }
+        base = _extend_resource_attributes(
+            base, fill_missing, overwrite=False, exclude=empty_defaults
+        )
+    return _extend_resource_attributes(base, attributes, overwrite=True)
 
 
 @contextmanager
-def publish_resource_attributes(attributes: dict):
+def publish_resource_attributes(
+    attributes: dict, *, use_current: bool = False, fill_missing: Optional[dict] = None
+):
     """Publish attributes into the environment, for a child spawned inside.
 
     ``multiprocessing.Process`` has no ``env``, so the environment at ``start()``
@@ -299,7 +321,17 @@ def publish_resource_attributes(attributes: dict):
     if not _AVAILABLE:
         yield
         return
-    with _publish_resource_attributes(attributes, overwrite=True):
+    carrier = extended_resource_attributes(
+        attributes, use_current=use_current, fill_missing=fill_missing
+    )
+    # Lens owns parsing, encoding and exact restoration. Exclude the live keys
+    # before publishing the selected base so snapshot callers cannot pick up
+    # identity from a previous cycle or a later trainer publication.
+    with _publish_resource_attributes(
+        _parse_resource_attributes(carrier),
+        overwrite=True,
+        exclude=_parse_resource_attributes(os.environ.get("OTEL_RESOURCE_ATTRIBUTES", "")),
+    ):
         yield
 
 
