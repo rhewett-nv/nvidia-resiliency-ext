@@ -249,35 +249,50 @@ def set_span_attributes(attributes: dict) -> None:
     _safe_set_span_attributes(trace.get_current_span(), attributes)
 
 
-def extended_resource_attributes(attributes: dict) -> str:
-    """Extend the inherited ``OTEL_RESOURCE_ATTRIBUTES`` with more pairs.
-
-    NVRx never parses the variable -- it is an opaque string to extend. Extending is
-    always from the value inherited at start, never from the last extension, or a
-    relaunched cohort accumulates a key per cycle. ``overwrite`` because an NVRx key
-    already in the inherited value is stale: this process is the authority on it.
-    The local encoder is the fallback for a plain OTel SDK without nemo-lens.
-    """
+def _extend_resource_attribute_value(base: str, attributes: dict, overwrite: bool) -> str:
+    """Extend one encoded Resource carrier using Lens or the local fallback."""
     if _AVAILABLE:
-        return _extend_resource_attributes(
-            _INHERITED_RESOURCE_ATTRIBUTES, attributes, overwrite=True
-        )
+        return _extend_resource_attributes(base, attributes, overwrite=overwrite)
 
     from urllib.parse import quote
 
     added = {str(key): quote(str(value), safe="") for key, value in attributes.items()}
-    # Inherited segments are kept byte for byte, dropping only the keys being
-    # overwritten, so this path and nemo-lens's encoder agree on the result.
-    kept = [
-        segment
-        for segment in _INHERITED_RESOURCE_ATTRIBUTES.split(",")
-        if segment.strip() and segment.split("=", 1)[0].strip() not in added
+    valid_segments = [
+        (segment, segment.split("=", 1)[0].strip())
+        for segment in base.split(",")
+        if "=" in segment and segment.split("=", 1)[0].strip()
     ]
+    existing_keys = {key for _, key in valid_segments}
+    if not overwrite:
+        added = {key: value for key, value in added.items() if key not in existing_keys}
+    kept = [segment for segment, key in valid_segments if not overwrite or key not in added]
     return ",".join(kept + [f"{key}={value}" for key, value in added.items()])
 
 
+def extended_resource_attributes(
+    attributes: dict, *, use_current: bool = False, fill_missing: Optional[dict] = None
+) -> str:
+    """Extend an ``OTEL_RESOURCE_ATTRIBUTES`` carrier with more pairs.
+
+    NVRx never parses the variable -- it is an opaque string to extend. Extending is
+    from the value inherited at import by default, never from the last extension, or
+    a relaunched cohort accumulates a key per cycle. ``use_current`` is reserved for
+    a child-process boundary that must inherit Resource identity published after this
+    module was imported. ``fill_missing`` supplies compatibility defaults without
+    replacing identity already present in the selected base. ``attributes`` always
+    overwrite because the publishing process is authoritative for them.
+    """
+    key = "OTEL_RESOURCE_ATTRIBUTES"
+    base = os.environ.get(key, "") if use_current else _INHERITED_RESOURCE_ATTRIBUTES
+    if fill_missing:
+        base = _extend_resource_attribute_value(base, fill_missing, overwrite=False)
+    return _extend_resource_attribute_value(base, attributes, overwrite=True)
+
+
 @contextmanager
-def publish_resource_attributes(attributes: dict):
+def publish_resource_attributes(
+    attributes: dict, *, use_current: bool = False, fill_missing: Optional[dict] = None
+):
     """Publish attributes into the environment, for a child spawned inside.
 
     ``multiprocessing.Process`` has no ``env``, so the environment at ``start()``
@@ -287,7 +302,9 @@ def publish_resource_attributes(attributes: dict):
     """
     key = "OTEL_RESOURCE_ATTRIBUTES"
     previous = os.environ.get(key)
-    os.environ[key] = extended_resource_attributes(attributes)
+    os.environ[key] = extended_resource_attributes(
+        attributes, use_current=use_current, fill_missing=fill_missing
+    )
     try:
         yield
     finally:
