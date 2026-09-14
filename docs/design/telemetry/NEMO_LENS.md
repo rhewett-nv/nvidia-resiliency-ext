@@ -44,6 +44,31 @@ graph TD
 
 ## `shared_utils/telemetry.py`
 
+### Job and worker-attempt identity
+
+The long-lived FT launcher calls Lens with `derive_run_uuid=False`: its Resource
+has job identity, not a permanent `nv.dl.run.uuid`. Initialization and waiting
+for a rendezvous round remain job-scoped. After the barrier synchronizes the
+round, the launcher opens a cycle trace with a run UUID derived by Lens using
+the exact restart count that will be sent to workers and the rendezvous run ID.
+The same UUID is explicitly published in the worker Resource carrier, replacing
+any stale attempt UUID inherited by the launcher. Trainers and checkpoint
+workers retain normal Lens Resource behavior.
+
+Cycle roots and all NVRx child spans carry the UUID as a **span attribute**.
+`Phase.open(..., run_uuid=...)` scopes that identity through a context variable;
+`span`, `trace_fn`, marks and backdated spans attach it explicitly. Closing the
+phase restores the prior context. Async tasks inherit Python context; any new
+thread emitting cycle children must receive an explicit copied context (as it
+must for trace parentage). The launcher shutdown helper thread only flushes
+providers; it does not create cycle spans.
+
+A standby or stale-round retry closes its previous cycle before waiting and
+opens a new trace after the next round is synchronized. A cycle is therefore
+one attempted worker round, not the entire possibly multi-round rendezvous call.
+Viewer run filters must inspect launcher span attributes as well as trainer and
+checkpoint-worker Resource attributes.
+
 Exports, in three groups:
 
 - **Spans** — `span`, `trace_fn`, `ManualSpan`, `Phase`, `mark`, `backdated_span`, `set_span_attributes`, `record_process_startup`
@@ -185,7 +210,11 @@ A cycle opens with a `nv.nvrx.ftl.cycle_start` marker, which exports immediately
 
 A cycle that never closes leaves its marker and every completed child. Absence of the backdated span is the signal.
 
-`nv.nvrx.ftl.run` nests inside `nv.nvrx.ftl.cycle`: the cycle opens at rendezvous and closes when the next one opens, the run opens once `_start_workers` returns and closes when the workers stop. **`cycle` minus `run` is the cycle's resiliency overhead** — rendezvous, health check, worker launch, teardown. NVRx carries no per-span overhead label; the nesting is what answers the question, and it composes across cycles where a boolean would not.
+`nv.nvrx.ftl.run` nests inside `nv.nvrx.ftl.cycle`: the cycle opens after the round
+is synchronized and closes when that attempt ends. The run opens once
+`_start_workers` returns and closes when the workers stop. **`cycle` minus `run`
+is the attempt's resiliency overhead** — rendezvous, health check, worker launch,
+teardown. Waiting for an open round is job-scoped and measured separately.
 
 ```mermaid
 sequenceDiagram
@@ -196,12 +225,13 @@ sequenceDiagram
     Note over L: nv.nvrx.ftl.python.startup, nv.nvrx.ftl.python.imports (backdated)
 
     loop each cycle
-        L->>L: mark nv.nvrx.ftl.cycle_start, retain its SpanContext
         L->>R: next_rendezvous() [sync]
         loop each rendezvous round
-            R->>R: nv.nvrx.ftl.await_round
+            R->>R: nv.nvrx.ftl.await_round (job-scoped), synchronize round
+            R->>L: open cycle_start with this round's run UUID
             R->>R: open nv.nvrx.ftl.rendezvous, closing the previous round's
             R->>R: nv.nvrx.ftl.health_check
+            Note over R,L: standby/retry closes this cycle before another wait
         end
         R->>R: close nv.nvrx.ftl.rendezvous {nv.nvrx.ftl.group.rank, nv.nvrx.ftl.membership}
         R-->>L: return
@@ -256,9 +286,9 @@ A hot spare produces one `await_round` / `rendezvous` pair per round, so volume 
 | Local failure, restart granted or budget exhausted | `failed`                                           |
 | Healthy node joins a peer restart                  | `peer_restart`                                     |
 | Health check exclusion (`UnhealthyNodeException`)  | `excluded`                                         |
-| Standby node, job ends                             | `standby`                                          |
+| Standby/late joiner leaves an attempted round       | `standby`                                          |
 | Attribution stop / peer no-restart                 | `terminated`                                       |
-| Signal                                             | _(no cycle span emitted; the marker stands alone)_ |
+| Signal                                             | _(cycle closed during final cleanup; outcome may be absent)_ |
 
 The exclusion and standby handlers live in `_rendezvous`, so they cover the first rendezvous as well as every restart.
 
