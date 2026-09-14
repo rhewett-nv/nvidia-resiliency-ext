@@ -24,6 +24,8 @@ failure into the workload. They run with or without nemo-lens installed.
 import ast
 import os
 import pathlib
+import subprocess
+import sys
 import threading
 import time
 import unittest
@@ -33,8 +35,265 @@ from urllib.parse import unquote
 from nvidia_resiliency_ext.shared_utils import telemetry
 
 
+@unittest.skipUnless(telemetry._AVAILABLE, "requires nemo-lens")
+class TestCycleRunIdentity(unittest.TestCase):
+    def test_exported_cycles_match_worker_resources(self):
+        # Real providers in a fresh process: do not leak SDK globals into the
+        # existing no-op tests. Execute the launcher's actual callback methods
+        # without importing its Linux/GPU runtime dependencies on a test host.
+        code = r'''
+import ast, asyncio, os, pathlib, subprocess, sys, json, time
+from types import SimpleNamespace
+from unittest.mock import patch
+from contextvars import copy_context
+from concurrent.futures import ThreadPoolExecutor
+from opentelemetry import trace
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from nemo.lens import setup_telemetry as lens_setup
+from nvidia_resiliency_ext.shared_utils import telemetry
+
+os.environ.update(SLURM_JOB_ID='123', SLURM_CLUSTER_NAME='test',
+                  NEMO_LENS_ENABLED='true', NEMO_LENS_METRICS_ENABLED='false',
+                  NEMO_LENS_SPAN_GROUPS='all', OTEL_RESOURCE_ATTRIBUTES='nv.dl.run.uuid=stale')
+exporter = InMemorySpanExporter()
+telemetry._setup_telemetry = lambda config, **kw: lens_setup(config, span_exporter=exporter, **kw)
+handle = telemetry.setup_telemetry('nvrx.ft_launcher', 'agent', derive_run_uuid=False)
+with telemetry.span('nvrx.ft', 'init'):
+    pass
+path = pathlib.Path(telemetry.__file__).parents[1] / 'fault_tolerance' / 'launcher.py'
+tree = ast.parse(path.read_text())
+methods = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+           and n.name in ('_open_telemetry_cycle', '_close_telemetry_cycle')]
+namespace = {'telemetry': telemetry}
+exec(compile(ast.Module(body=methods, type_ignores=[]), str(path), 'exec'), namespace)
+agent = SimpleNamespace(_cycle_phase=telemetry.Phase(), _node_id='node',
+    _worker_group=SimpleNamespace(spec=SimpleNamespace(
+        rdzv_handler=SimpleNamespace(get_run_id=lambda: 'rdzv'))))
+agent._open_telemetry_cycle = lambda count: namespace['_open_telemetry_cycle'](agent, count)
+agent._close_telemetry_cycle = lambda: namespace['_close_telemetry_cycle'](agent)
+barrier_path = path.with_name('ft_rendezvous_barrier.py')
+barrier_tree = ast.parse(barrier_path.read_text())
+perform = next(n for n in ast.walk(barrier_tree)
+               if isinstance(n, ast.FunctionDef) and n.name == 'perform_rendezvous')
+loop = next(n for n in perform.body if isinstance(n, ast.While))
+prefix = []
+for statement in loop.body:
+    if isinstance(statement, ast.Assign) and any(
+        isinstance(t, ast.Attribute) and t.attr == '_rendezvous_start_time'
+        for t in statement.targets):
+        break
+    prefix.append(statement)
+round_entry = compile(ast.Module(body=prefix, type_ignores=[]), str(barrier_path), 'exec')
+barrier = SimpleNamespace(_agent=agent, _round=-1, _rdzv_span=telemetry.ManualSpan())
+stage_ns = {'self': barrier, 'node_desc': 'node', 'span': telemetry.span,
+            'record_profiling_event': lambda *a, **k: None,
+            'ProfilingEvent': SimpleNamespace(AWAIT_ROUND_STARTED=0, AWAIT_ROUND_COMPLETED=1)}
+worker_code = """
+import json
+from nemo.lens import NemoLensConfig, setup_telemetry
+from opentelemetry import trace
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+e = InMemorySpanExporter()
+h = setup_telemetry(NemoLensConfig(enabled=True, metrics_enabled=False), span_exporter=e)
+with h.tracer.start_as_current_span('worker'): pass
+trace.get_tracer_provider().force_flush()
+print(json.dumps(dict(e.get_finished_spans()[0].resource.attributes)))
+h.shutdown()
+"""
+uuids = []
+for restart_count in (0, 3):  # skipped rounds must not be replaced with a local counter
+    # Execute the actual barrier round-entry statements. The count changes
+    # inside wait, so opening before synchronization would fail this test.
+    barrier._wait_for_rendezvous_open = lambda node: setattr(barrier, '_round', restart_count)
+    exec(round_entry, stage_ns)
+    identity = telemetry.worker_run_attributes(restart_count, 'rdzv')
+    run_uuid = identity['nv.dl.run.uuid']
+    uuids.append(run_uuid)
+    @telemetry.trace_fn('nvrx.ft', 'decorated')
+    def work():
+        with telemetry.span('nvrx.ft', 'nested'): pass
+    work()
+    @telemetry.trace_fn('nvrx.ft', 'async')
+    async def async_work():
+        with telemetry.span('nvrx.ft', 'async_nested'): pass
+    asyncio.run(async_work())
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(copy_context().run, work).result()
+    telemetry.backdated_span('nvrx.ft', 'backdated', time.time()-1, time.time())
+    try:
+        with telemetry.span('nvrx.ft', 'error'):
+            raise ValueError('test')
+    except ValueError:
+        pass
+    namespace['_close_telemetry_cycle'](agent)
+    trace.get_tracer_provider().force_flush()
+    cycle = exporter.get_finished_spans()
+    root = next(s for s in cycle if s.name == 'nv.nvrx.ftl.cycle_start'
+                and s.attributes['nv.nvrx.cycle.index'] == restart_count)
+    for s in cycle:
+        assert 'nv.dl.run.uuid' not in s.resource.attributes
+        if s.context.trace_id == root.context.trace_id or s.attributes.get('nv.dl.run.uuid') == run_uuid:
+            assert s.attributes['nv.dl.run.uuid'] == run_uuid
+    assert telemetry._CYCLE_RUN_UUID.get() is None
+    carrier = telemetry.extended_resource_attributes(identity)
+    # Execute the production worker-carrier assignments, not a test-only map.
+    start_workers = next(n for n in ast.walk(tree)
+                         if isinstance(n, ast.FunctionDef) and n.name == '_start_workers')
+    assignments = [n for n in start_workers.body if isinstance(n, ast.Assign)
+                   and any(isinstance(t, ast.Name) and t.id in
+                           ('worker_resource_attrs', 'cohort_env') for t in n.targets)]
+    agent._infra_placement_attrs = lambda: {}
+    agent._launch_budget_attrs = lambda: {}
+    worker_ns = {'self': agent, 'telemetry': telemetry, 'restart_count': restart_count,
+                 'spec': agent._worker_group.spec}
+    exec(compile(ast.Module(body=assignments, type_ignores=[]), str(path), 'exec'), worker_ns)
+    carrier = worker_ns['cohort_env']['OTEL_RESOURCE_ATTRIBUTES']
+    env = dict(os.environ, OTEL_RESOURCE_ATTRIBUTES=carrier,
+               TORCHELASTIC_RESTART_COUNT=str(restart_count))
+    trainer = json.loads(subprocess.check_output([sys.executable, '-c', worker_code], env=env, text=True))
+    assert trainer['nv.dl.run.uuid'] == run_uuid
+    with patch.dict(os.environ, {'OTEL_RESOURCE_ATTRIBUTES': carrier}):
+        with telemetry.publish_resource_attributes(
+            {'service.name': 'nvrx.ckpt_worker', 'nv.dl.role': 'ckpt_worker'},
+            use_current=True, fill_missing={'nv.dl.rank': 3},
+        ):
+            env['OTEL_RESOURCE_ATTRIBUTES'] = os.environ['OTEL_RESOURCE_ATTRIBUTES']
+        assert os.environ['OTEL_RESOURCE_ATTRIBUTES'] == carrier
+    ckpt = json.loads(subprocess.check_output([sys.executable, '-c', worker_code], env=env, text=True))
+    assert ckpt['nv.dl.run.uuid'] == run_uuid
+    assert ckpt.get('nv.dl.job.uuid') == trainer.get('nv.dl.job.uuid')
+    assert ckpt['nv.dl.role'] == 'ckpt_worker'
+    assert type(ckpt['nv.dl.rank']) is int
+    with telemetry.span('nvrx.ft', 'await_round'): pass
+assert uuids[0] != uuids[1]
+trace.get_tracer_provider().force_flush()
+for s in exporter.get_finished_spans():
+    if s.name in ('init', 'await_round'):
+        assert 'nv.dl.run.uuid' not in s.attributes
+        assert 'nv.dl.run.uuid' not in s.resource.attributes
+handle.shutdown()
+'''
+        for scenario in ("slurm", "array", "local"):
+            with self.subTest(scenario=scenario):
+                variant = code
+                insertion = ""
+                if scenario == "array":
+                    insertion = (
+                        "os.environ.update(SLURM_ARRAY_JOB_ID='100', SLURM_ARRAY_TASK_ID='2')\n"
+                    )
+                elif scenario == "local":
+                    insertion = "os.environ.pop('SLURM_JOB_ID', None)\n"
+                variant = variant.replace(
+                    "exporter = InMemorySpanExporter()",
+                    insertion + "exporter = InMemorySpanExporter()",
+                    1,
+                )
+                result = subprocess.run(
+                    [sys.executable, "-c", variant], capture_output=True, text=True, timeout=45
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class TestCycleTransitionCleanup(unittest.TestCase):
+    def test_retry_paths_close_rendezvous_before_cycle(self):
+        from types import SimpleNamespace
+
+        path = (
+            pathlib.Path(telemetry.__file__).parents[1] / "fault_tolerance/ft_rendezvous_barrier.py"
+        )
+        tree = ast.parse(path.read_text())
+        perform = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "perform_rendezvous"
+        )
+        loop = next(n for n in perform.body if isinstance(n, ast.While))
+        stale = next(
+            n
+            for n in ast.walk(perform)
+            if isinstance(n, ast.ExceptHandler)
+            and isinstance(n.type, ast.Name)
+            and n.type.id == "_StaleRendezvousRoundError"
+        )
+        for membership, rank in (("standby", 4), ("late_joiner", -1), ("peer_restart", 0)):
+            with self.subTest(membership=membership):
+                events = []
+                agent = SimpleNamespace(
+                    _close_telemetry_cycle=lambda attrs: events.append(("cycle", attrs))
+                )
+                barrier = SimpleNamespace(
+                    _agent=agent,
+                    _rdzv_span=SimpleNamespace(close=lambda: events.append(("rendezvous", None))),
+                )
+                ns = {
+                    "self": barrier,
+                    "rank": rank,
+                    "GroupRankStatus": SimpleNamespace(UNASSIGNED=SimpleNamespace(value=-1)),
+                    "node_desc": "node",
+                    "e": SimpleNamespace(observed_round=3, attempted_round=0),
+                    "log": unittest.mock.Mock(),
+                }
+                if membership == "peer_restart":
+                    wrapper = ast.parse("for _ in (0,):\n    pass")
+                    wrapper.body[0].body = stale.body
+                    module = wrapper
+                else:
+                    module = ast.Module(body=loop.body[-2:], type_ignores=[])
+                exec(compile(ast.fix_missing_locations(module), str(path), "exec"), ns)
+                expected = (
+                    {"nv.nvrx.cycle.outcome": "peer_restart"}
+                    if membership == "peer_restart"
+                    else {"nv.nvrx.cycle.outcome": "standby", "nv.nvrx.ftl.membership": membership}
+                )
+                self.assertEqual(events, [("rendezvous", None), ("cycle", expected)])
+
+    def test_launcher_closes_phases_when_worker_shutdown_raises(self):
+        from types import SimpleNamespace
+
+        path = pathlib.Path(telemetry.__file__).parents[1] / "fault_tolerance/launcher.py"
+        tree = ast.parse(path.read_text())
+        agent_class = next(
+            n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "LocalElasticAgent"
+        )
+        run = next(
+            n for n in agent_class.body if isinstance(n, ast.FunctionDef) and n.name == "run"
+        )
+        final = next(n.finalbody for n in run.body if isinstance(n, ast.Try) and n.finalbody)
+        events = []
+
+        def fail_shutdown():
+            raise RuntimeError("shutdown failed")
+
+        agent = SimpleNamespace(
+            _shutdown=fail_shutdown,
+            _tel_handle=object(),
+            _run_phase=SimpleNamespace(close=lambda: events.append("run")),
+            _cycle_phase=SimpleNamespace(close=lambda: events.append("cycle")),
+        )
+        ns = {
+            "self": agent,
+            "shutdown_called": False,
+            "start_time": time.monotonic(),
+            "time": time,
+            "telemetry": SimpleNamespace(shutdown=lambda handle: events.append("telemetry")),
+        }
+        with self.assertRaisesRegex(RuntimeError, "shutdown failed"):
+            exec(compile(ast.Module(body=final, type_ignores=[]), str(path), "exec"), ns)
+        self.assertEqual(events, ["run", "cycle", "telemetry"])
+
+
 class TestTelemetryIsInert(unittest.TestCase):
     """Instrumentation must be a no-op before/without setup_telemetry()."""
+
+    def test_cycle_identity_without_lens(self):
+        with unittest.mock.patch.object(telemetry, "_AVAILABLE", False):
+            self.assertEqual(telemetry.worker_run_attributes(3, "rdzv"), {})
+            phase = telemetry.Phase()
+            phase.open("nvrx.ft", "nv.nvrx.ftl.cycle", run_uuid="unused")
+            self.assertIsNone(telemetry._CYCLE_RUN_UUID.get())
+            phase.close()
+            handle = telemetry.setup_telemetry("nvrx.ft_launcher", derive_run_uuid=False)
+            handle.shutdown()
 
     def test_managed_span_yields_and_runs_body(self):
         ran = False
