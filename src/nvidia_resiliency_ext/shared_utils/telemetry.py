@@ -279,10 +279,11 @@ def _emit(
         name,
         start,
         end,
+        group=group,
         context=context,
         attributes=_cycle_attributes(attributes),
     )
-    return recorded.get_span_context()
+    return recorded.get_span_context() if recorded is not None else None
 
 
 def backdated_span(
@@ -292,14 +293,15 @@ def backdated_span(
     end: Optional[float],
     attributes: Optional[dict] = None,
     parent=None,
-) -> None:
+):
     """Record a span for a window that elapsed before there was a tracer.
 
     ``start`` and ``end`` are wall-clock seconds; ``parent`` is usually the
     ``SpanContext`` of the ``mark`` that opened the window, and without one the span
-    roots its own trace. A no-op unless the window is a positive interval.
+    roots its own trace. Lens owns timing, gating and completion; zero duration
+    is valid. Return the completed span context when available.
     """
-    if start is None or end is None or end <= start:
+    if start is None or end is None:
         return
     if not _AVAILABLE or not _is_span_group_enabled(group):
         return
@@ -308,7 +310,7 @@ def backdated_span(
     context = _otel_context.Context()
     if parent is not None:
         context = _otel_trace.set_span_in_context(_otel_trace.NonRecordingSpan(parent), context)
-    _emit(group, name, start, end, attributes, context)
+    return _emit(group, name, start, end, attributes, context)
 
 
 def mark(group: str, name: str, attributes: Optional[dict] = None):
@@ -318,6 +320,8 @@ def mark(group: str, name: str, attributes: Optional[dict] = None):
     immediately, so the context outlives it -- ids, not a handle to anything live.
     Inherits the ambient span, so a mark nests where an ordinary span would.
     """
+    if not _AVAILABLE or not _is_span_group_enabled(group):
+        return None
     now = time.time()
     return _emit(group, name, now, now, attributes)
 
@@ -485,16 +489,20 @@ class Phase:
                 # the stale ambient context.
                 logger.debug("Out-of-order close for phase %s", self._name, exc_info=True)
             self._token = None
-        backdated_span(
-            self._group,
-            self._name,
-            self._start,
-            time.time(),
-            self._attributes,
-            parent=self._parent,
-        )
-        self._group = self._name = self._start = self._parent = None
-        self._attributes = {}
-        if self._run_uuid_token is not None:
-            _CYCLE_RUN_UUID.reset(self._run_uuid_token)
-            self._run_uuid_token = None
+        try:
+            backdated_span(
+                self._group,
+                self._name,
+                self._start,
+                time.time(),
+                self._attributes,
+                parent=self._parent,
+            )
+        finally:
+            # Lens can reject an invalid interval (for example a wall-clock
+            # adjustment). Preserve that error without leaking attempt identity.
+            self._group = self._name = self._start = self._parent = None
+            self._attributes = {}
+            if self._run_uuid_token is not None:
+                _CYCLE_RUN_UUID.reset(self._run_uuid_token)
+                self._run_uuid_token = None

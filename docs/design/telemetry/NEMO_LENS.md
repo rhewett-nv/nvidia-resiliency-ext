@@ -45,6 +45,16 @@ graph TD
 
 ### Job and worker-attempt identity
 
+Explicitly timed spans and instant markers both use Lens's existing
+`span_utilities.emit_span`, through NVRx's local `_emit` helper. NVRx supplies
+its tracer, cycle attributes and phase parent context, and extracts SpanContext
+from the returned completed Span when it is not None. An instant uses one clock
+reading for both endpoints. Equal endpoints are valid; an end before the start
+is rejected by Lens. Missing optional startup anchors suppress that interval.
+Lens owns emission, optional group filtering, timestamp validation/conversion,
+attribute safety and completion. This companion requires Lens's optional `group=` support; deploy
+the matching Lens revision with it.
+
 The long-lived FT launcher calls Lens with `derive_run_uuid=False`: its Resource
 retains `nv.dl.job.uuid` and excludes `nv.dl.run.uuid`, including a run UUID
 already present in inherited or explicit Resource attributes. Initialization and waiting
@@ -244,7 +254,7 @@ sequenceDiagram
 | `nv.nvrx.ftl.teardown`       | `nvrx.ft`  | `launcher.py`              | `_stop_workers`                                          |
 | `nv.nvrx.ftl.attribution`    | `nvrx.ft`  | `health_check.py`          | an attribution lookup (root span)                        |
 
-Both `nv.nvrx.ftl.python.startup` and `nv.nvrx.ftl.python.imports` are measured within this process — `psutil.Process().create_time()` and two `time.time()` stamps — and backdated once telemetry is up.
+Both `nv.nvrx.ftl.python.startup` and `nv.nvrx.ftl.python.imports` are measured within this process — Lens's `linux_process_create_time()` and two `time.time()` stamps — and backdated once telemetry is up.
 
 `fault` is an instant because `teardown` only starts once the restart decision is made; without it the interval between detecting a failure and deciding what to do is unmeasured.
 
