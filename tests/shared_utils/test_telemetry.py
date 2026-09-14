@@ -105,6 +105,8 @@ for restart_count in (0, 3):  # skipped rounds must not be replaced with a local
     # inside wait, so opening before synchronization would fail this test.
     barrier._wait_for_rendezvous_open = lambda node: setattr(barrier, '_round', restart_count)
     exec(round_entry, stage_ns)
+    run_phase = telemetry.Phase()
+    run_phase.open('nvrx.ft', 'nv.nvrx.ftl.run', {'run.phase': True})
     identity = telemetry.worker_run_attributes(restart_count, 'rdzv')
     run_uuid = identity['nv.dl.run.uuid']
     uuids.append(run_uuid)
@@ -124,11 +126,24 @@ for restart_count in (0, 3):  # skipped rounds must not be replaced with a local
             raise ValueError('test')
     except ValueError:
         pass
+    run_phase.close()
     namespace['_close_telemetry_cycle'](agent)
     trace.get_tracer_provider().force_flush()
     cycle = exporter.get_finished_spans()
     root = next(s for s in cycle if s.name == 'nv.nvrx.ftl.cycle_start'
                 and s.attributes['nv.nvrx.cycle.index'] == restart_count)
+    assert root.start_time == root.end_time
+    closing = next(s for s in cycle if s.name == 'nv.nvrx.ftl.cycle'
+                   and s.attributes['nv.nvrx.cycle.index'] == restart_count)
+    assert closing.parent == root.context
+    run_marker = next(s for s in cycle if s.name == 'nv.nvrx.ftl.run_start'
+                      and s.attributes['nv.dl.run.uuid'] == run_uuid)
+    run_closing = next(s for s in cycle if s.name == 'nv.nvrx.ftl.run'
+                       and s.attributes['nv.dl.run.uuid'] == run_uuid)
+    assert run_marker.start_time == run_marker.end_time
+    assert run_marker.parent == root.context
+    assert run_marker.attributes['run.phase'] is True
+    assert run_closing.parent == run_marker.context
     for s in cycle:
         assert 'nv.dl.run.uuid' not in s.resource.attributes
         if s.context.trace_id == root.context.trace_id or s.attributes.get('nv.dl.run.uuid') == run_uuid:

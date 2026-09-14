@@ -46,6 +46,14 @@ graph TD
 
 ### Job and worker-attempt identity
 
+Explicitly timed spans and instant markers both use Lens's existing
+`span_utilities.emit_span`. NVRx supplies cycle attributes and phase parent
+context, and extracts the returned completed Span's context. An instant uses
+one clock reading for both endpoints. Lens owns emission, optional group
+filtering, default tracer selection, timestamp conversion, attribute safety and
+completion. This companion requires Lens's optional `group=` support; deploy
+the matching Lens revision with it.
+
 The long-lived FT launcher calls Lens with `derive_run_uuid=False`: its Resource
 has job identity, not a permanent `nv.dl.run.uuid`. Initialization and waiting
 for a rendezvous round remain job-scoped. After the barrier synchronizes the

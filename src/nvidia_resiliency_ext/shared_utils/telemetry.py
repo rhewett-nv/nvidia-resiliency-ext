@@ -67,6 +67,7 @@ try:
     from nemo.lens import setup_telemetry as _setup_telemetry
     from nemo.lens.resources import extend_otel_resource_attributes as _extend_resource_attributes
     from nemo.lens.resources.slurm import derive_nv_dl_run_uuid as _derive_run_uuid
+    from nemo.lens.span_utilities import emit_span as _emit_span
 
     _AVAILABLE = True
 
@@ -256,28 +257,32 @@ def backdated_span(
     end: Optional[float],
     attributes: Optional[dict] = None,
     parent=None,
-) -> None:
+):
     """Record a span for a window that elapsed before there was a tracer.
 
     ``start`` and ``end`` are wall-clock seconds; ``parent`` is usually the
     ``SpanContext`` of the ``mark`` that opened the window, and without one the span
-    roots its own trace. A no-op unless the window is a positive interval.
+    roots its own trace. Lens owns timing, gating and completion; zero duration
+    is valid. Return the completed span context when available.
     """
-    if start is None or end is None or end <= start:
-        return
-    if not _AVAILABLE or not _is_span_group_enabled(group):
-        return
+    if not _AVAILABLE or start is None or end is None:
+        return None
     from opentelemetry import trace
     from opentelemetry.context import Context
 
     context = Context()
     if parent is not None:
         context = trace.set_span_in_context(trace.NonRecordingSpan(parent), context)
-    tracer = _get_tracer(__name__)
-    span = tracer.start_span(
-        name, context=context, start_time=int(start * 1e9), attributes=_cycle_attributes(attributes)
+    completed = _emit_span(
+        None,
+        name,
+        start,
+        end,
+        group=group,
+        attributes=_cycle_attributes(attributes),
+        context=context,
     )
-    span.end(end_time=int(end * 1e9))
+    return completed.get_span_context() if completed is not None else None
 
 
 def mark(group: str, name: str, attributes: Optional[dict] = None):
@@ -286,8 +291,13 @@ def mark(group: str, name: str, attributes: Optional[dict] = None):
     Returns its ``SpanContext``, or None when the group is off. A mark exports
     immediately, so the context outlives it -- ids, not a handle to anything live.
     """
-    with span(group, name, attributes) as recorded:
-        return recorded.get_span_context() if recorded is not None else None
+    if not _AVAILABLE or not _is_span_group_enabled(group):
+        return None
+    timestamp = time.time()
+    completed = _emit_span(
+        None, name, timestamp, timestamp, group=group, attributes=_cycle_attributes(attributes)
+    )
+    return completed.get_span_context() if completed is not None else None
 
 
 def set_span_attributes(attributes: dict) -> None:
