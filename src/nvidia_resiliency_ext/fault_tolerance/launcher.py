@@ -604,7 +604,6 @@ class LocalElasticAgent(SimpleElasticAgent):
             finally:
                 self._run_phase.close()
                 self._cycle_phase.close()
-                # Record execution time and restore cycle context even if shutdown fails.
                 self._total_execution_time = int(time.monotonic() - start_time)
                 telemetry.shutdown(self._tel_handle)
 
@@ -1542,7 +1541,7 @@ class LocalElasticAgent(SimpleElasticAgent):
         self._cycle_phase.set(self._joined_cycle_attrs(worker_group))
 
     def _open_telemetry_cycle(self, restart_count: int) -> None:
-        """Called after round synchronization, before any attempt spans export."""
+        """Start the cycle after the barrier sets the round number."""
         identity = telemetry.worker_run_attributes(
             restart_count, self._worker_group.spec.rdzv_handler.get_run_id()
         )
@@ -1559,7 +1558,7 @@ class LocalElasticAgent(SimpleElasticAgent):
         )
 
     def _close_telemetry_cycle(self, attributes=None) -> None:
-        """End a non-active attempt before the job-scoped wait for another round."""
+        """Close the cycle before waiting for another round."""
         self._cycle_phase.close(attributes)
 
 

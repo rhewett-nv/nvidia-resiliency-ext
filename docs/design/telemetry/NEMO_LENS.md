@@ -44,38 +44,27 @@ graph TD
 
 ## `shared_utils/telemetry.py`
 
+### Timed spans
+
+Intervals and instant markers use Lens's `emit_span()`. NVRx supplies the run
+UUID and parent context, then returns the recorded span's context. Markers use
+one clock reading for both timestamps. Use a Lens version that accepts `group`.
+
 ### Job and worker-attempt identity
 
-Explicitly timed spans and instant markers both use Lens's existing
-`span_utilities.emit_span`. NVRx supplies cycle attributes and phase parent
-context, and extracts the returned completed Span's context. An instant uses
-one clock reading for both endpoints. Lens owns emission, optional group
-filtering, default tracer selection, timestamp conversion, attribute safety and
-completion. This companion requires Lens's optional `group=` support; deploy
-the matching Lens revision with it.
+A launcher handles multiple worker attempts. It calls Lens with
+`derive_run_uuid=False` so its Resource contains the job UUID and no run UUID.
+After round synchronization, it derives a run UUID using Lens and the restart
+count sent to workers. It adds this UUID to cycle spans and passes it to trainer
+workers through `OTEL_RESOURCE_ATTRIBUTES`. Trainers and checkpoint workers
+store the UUID in their Resources.
 
-The long-lived FT launcher calls Lens with `derive_run_uuid=False`: its Resource
-has job identity, not a permanent `nv.dl.run.uuid`. Initialization and waiting
-for a rendezvous round remain job-scoped. After the barrier synchronizes the
-round, the launcher opens a cycle trace with a run UUID derived by Lens using
-the exact restart count that will be sent to workers and the rendezvous run ID.
-The same UUID is explicitly published in the worker Resource carrier, replacing
-any stale attempt UUID inherited by the launcher. Trainers and checkpoint
-workers retain normal Lens Resource behavior.
+`Phase` stores the current run UUID in a context variable and restores the
+previous value when it closes. Async tasks inherit the context. New threads
+require an explicit context copy.
 
-Cycle roots and all NVRx child spans carry the UUID as a **span attribute**.
-`Phase.open(..., run_uuid=...)` scopes that identity through a context variable;
-`span`, `trace_fn`, marks and backdated spans attach it explicitly. Closing the
-phase restores the prior context. Async tasks inherit Python context; any new
-thread emitting cycle children must receive an explicit copied context (as it
-must for trace parentage). The launcher shutdown helper thread only flushes
-providers; it does not create cycle spans.
-
-A standby or stale-round retry closes its previous cycle before waiting and
-opens a new trace after the next round is synchronized. A cycle is therefore
-one attempted worker round, not the entire possibly multi-round rendezvous call.
-Viewer run filters must inspect launcher span attributes as well as trainer and
-checkpoint-worker Resource attributes.
+Standby and retry paths close the cycle before waiting for another round.
+To filter by run UUID, check launcher span attributes and worker Resources.
 
 Exports, in three groups:
 
