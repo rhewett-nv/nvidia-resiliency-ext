@@ -199,7 +199,7 @@ def _cycle_attributes(attributes=None):
 
 
 def worker_run_attributes(restart_count: int, rendezvous_run_id: str) -> dict:
-    """Resolve identity with the exact restart count sent to trainer workers."""
+    """Return the run UUID for this worker attempt."""
     if not _AVAILABLE:
         return {}
     env = dict(os.environ)
@@ -210,7 +210,7 @@ def worker_run_attributes(restart_count: int, rendezvous_run_id: str) -> dict:
 
 
 def trace_fn(group, name, tracer=None):
-    """Decorate a span with cycle identity, without work before the group gate."""
+    """Add the current run UUID to spans from decorated functions."""
 
     def decorator(func):
         if inspect.iscoroutinefunction(func):

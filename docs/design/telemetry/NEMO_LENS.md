@@ -46,28 +46,19 @@ graph TD
 
 ### Job and worker-attempt identity
 
-The long-lived FT launcher calls Lens with `derive_run_uuid=False`: its Resource
-has job identity, not a permanent `nv.dl.run.uuid`. Initialization and waiting
-for a rendezvous round remain job-scoped. After the barrier synchronizes the
-round, the launcher opens a cycle trace with a run UUID derived by Lens using
-the exact restart count that will be sent to workers and the rendezvous run ID.
-The same UUID is explicitly published in the worker Resource carrier, replacing
-any stale attempt UUID inherited by the launcher. Trainers and checkpoint
-workers retain normal Lens Resource behavior.
+A launcher handles multiple worker attempts. It calls Lens with
+`derive_run_uuid=False` so its Resource contains the job UUID and no run UUID.
+After round synchronization, it derives a run UUID using Lens and the restart
+count sent to workers. It adds this UUID to cycle spans and passes it to trainer
+workers through `OTEL_RESOURCE_ATTRIBUTES`. Trainers and checkpoint workers
+store the UUID in their Resources.
 
-Cycle roots and all NVRx child spans carry the UUID as a **span attribute**.
-`Phase.open(..., run_uuid=...)` scopes that identity through a context variable;
-`span`, `trace_fn`, marks and backdated spans attach it explicitly. Closing the
-phase restores the prior context. Async tasks inherit Python context; any new
-thread emitting cycle children must receive an explicit copied context (as it
-must for trace parentage). The launcher shutdown helper thread only flushes
-providers; it does not create cycle spans.
+`Phase` stores the current run UUID in a context variable and restores the
+previous value when it closes. Async tasks inherit the context. New threads
+require an explicit context copy.
 
-A standby or stale-round retry closes its previous cycle before waiting and
-opens a new trace after the next round is synchronized. A cycle is therefore
-one attempted worker round, not the entire possibly multi-round rendezvous call.
-Viewer run filters must inspect launcher span attributes as well as trainer and
-checkpoint-worker Resource attributes.
+Standby and retry paths close the cycle before waiting for another round.
+To filter by run UUID, check launcher span attributes and worker Resources.
 
 Exports, in three groups:
 
